@@ -115,7 +115,8 @@ def migrate():
             ArticulosExtendidoNombre1,
             ArticulosExtendidoNombre2,
             ArticulosExtendidoNombre3,
-            ArticulosExtendidoObservaciones3
+            ArticulosExtendidoObservaciones3,
+            OcultarEnTPV
         FROM Articulos
         ORDER BY CodigoDeArticulo
     """)
@@ -175,7 +176,8 @@ def migrate():
                 texto1,
                 texto2,
                 texto3,
-                conservacion
+                conservacion,
+                ocultar_en_tpv
             ) = producto
 
             codigo = (codigo or "").strip()
@@ -407,6 +409,8 @@ def migrate():
 
             sf = dst_cursor.fetchone()
 
+            saleable_as_main = 0 if ocultar_en_tpv else 1
+
             if sf:
                 sale_format_id = sf.Id
             else:
@@ -420,13 +424,20 @@ def migrate():
                     )
                     VALUES
                     (
-                        ?, ?, 1, 0, 1, 1, 1,
+                        ?, ?, ?, 0, 1, 1, 1,
                         ?, ?, ?,
                         '0xFFFFFFFF',
                         '00000000-0000-0000-0000-000000000000',
                         0
                     )
-                """, nombre, new_product_id, nombre, nombre, nombre)
+                   """,
+                nombre,
+                new_product_id,
+                saleable_as_main,
+                nombre,
+                nombre,
+                nombre
+            )
 
                 dst_cursor.execute("""
                     SELECT Id
