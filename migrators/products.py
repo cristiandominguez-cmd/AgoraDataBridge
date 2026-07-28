@@ -51,8 +51,42 @@ def _load_vats(cursor):
     return ivas
 
 
+def _load_prices(cursor):
 
-IVA_MAP = {"E":"0","S":"4","R":"10","N":"21"}
+    cursor.execute("""
+        SELECT
+            CodigoDeArticulo,
+            Precio
+        FROM Tarifas
+        WHERE Tarifa = 1
+    """)
+
+    precios = {}
+
+    for row in cursor.fetchall():
+        precios[(row.CodigoDeArticulo or "").strip()] = float(row.Precio or 0)
+
+    return precios
+
+
+def _load_default_price_list(cursor):
+
+    cursor.execute("""
+        SELECT TOP 1 Id
+        FROM PriceList
+        WHERE DeletionDate IS NULL
+        ORDER BY Id
+    """)
+
+    row = cursor.fetchone()
+
+    if row is None:
+        raise Exception("No existe ninguna lista de precios.")
+
+    return row.Id
+
+
+IVA_MAP = {"E": "0", "S": "4", "R": "10", "N": "21"}
 
 def migrate():
 
@@ -65,6 +99,8 @@ def migrate():
     familias = _load_families(dst_cursor)
     familias_origen = _load_source_families(src_cursor)
     ivas = _load_vats(dst_cursor)
+    price_list_id = _load_default_price_list(dst_cursor)
+    precios = _load_prices(src_cursor)
 
     src_cursor.execute("""
         SELECT
@@ -75,7 +111,11 @@ def migrate():
             PrecioCosteReal,
             UnidadDeMedida,
             TratarStock,
-            CodigoBarras_ean13
+            CodigoBarras_ean13,
+            ArticulosExtendidoNombre1,
+            ArticulosExtendidoNombre2,
+            ArticulosExtendidoNombre3,
+            ArticulosExtendidoObservaciones3
         FROM Articulos
         ORDER BY CodigoDeArticulo
     """)
@@ -116,6 +156,8 @@ def migrate():
         return
 
     insertados = 0
+    omitidos = 0
+    errores = 0
 
     try:
 
@@ -129,10 +171,15 @@ def migrate():
                 precio_coste,
                 unidad,
                 tratar_stock,
-                codigo_barras
+                codigo_barras,
+                texto1,
+                texto2,
+                texto3,
+                conservacion
             ) = producto
 
             codigo = (codigo or "").strip()
+            precio_venta = float(precios.get(codigo, 0) or 0)
             nombre = (nombre or "").strip()
 
             familia = (familia or "").strip().upper()
@@ -165,31 +212,62 @@ def migrate():
 
             stock_control = 1 if tratar_stock else 0
 
+            lineas = []
+
+            TEXTOS_EXCLUIDOS = (
+                "FECHA DESHUESADO",
+            )
+
+            for texto in (texto1, texto2, texto3):
+
+                if not texto:
+                    continue
+
+                texto = texto.strip()
+
+                if not texto:
+                    continue
+
+                if any(x in texto.upper() for x in TEXTOS_EXCLUIDOS):
+                    continue
+
+                lineas.append(texto)
+
+            if conservacion and conservacion.strip():
+                lineas.append(conservacion.strip())
+
+            label_lines = None if not lineas else "\r\n".join(lineas)
+
+            print(codigo, repr(label_lines))
+
             dst_cursor.execute("""
-                SELECT Id
+                SELECT
+                    Id,
+                    Name,
+                    PriceLookUpCode
                 FROM Product
-                WHERE PriceLookUpCode = ?
-                  AND DeletionDate IS NULL
-            """, codigo)
+                WHERE DeletionDate IS NULL
+                  AND (
+                        PriceLookUpCode = ?
+                     OR Name = ?
+                  )
+            """, codigo, nombre)
 
             row = dst_cursor.fetchone()
 
             if row:
-                new_product_id = row.Id
+                print(
+                    f"[EXISTE] Código origen={codigo} "
+                    f"Nombre={nombre} "
+                    f"ID={row.Id} "
+                    f"Código destino={row.PriceLookUpCode}"
+                )
+                omitidos += 1
+                continue
 
-                dst_cursor.execute("""
-                    SELECT Id
-                    FROM SaleFormat
-                    WHERE ProductId = ?
-                """, new_product_id)
-
-                sf = dst_cursor.fetchone()
-
-                if sf:
-                    print(f"Ya completo: {codigo}")
-                    continue
-            else:
-                dst_cursor.execute("""
+            print(f"[NUEVO] {codigo} - {nombre}")
+            print("ANTES DEL INSERT PRODUCT")
+            dst_cursor.execute("""
                 INSERT INTO Product
                 (
                     Type,
@@ -262,17 +340,17 @@ def migrate():
                     0,
                     0,
                     0,
+                    ?,
+                    1,
+                    NULL,
+                    NULL,
+                    '',
+                    '',
+                    '',
                     '',
                     NULL,
                     NULL,
                     NULL,
-                    0,
-                    '',
-                    '',
-                    '',
-                    NULL,
-                    NULL,
-                    0,
                     0,
                     0,
                     0,
@@ -287,49 +365,136 @@ def migrate():
                 stock_control,
                 precio_coste or 0,
                 family_id,
-                vat_id
+                vat_id,
+                label_lines
             )
+            print("DESPUES DEL INSERT PRODUCT")
+            dst_cursor.execute("""
+                SELECT Id
+                FROM Product
+                WHERE PriceLookUpCode = ?
+                  AND DeletionDate IS NULL
+                ORDER BY Id DESC
+            """, codigo)
 
-                new_product_id = dst_cursor.execute(
-                    "SELECT CAST(SCOPE_IDENTITY() AS INT)"
-                ).fetchone()[0]
+            new_product_id = dst_cursor.fetchone()[0]
 
             dst_cursor.execute("""
-                INSERT INTO SaleFormat
-                (
-                    Name, ProductId, SaleableAsMain, SaleableAsAddin,
-                    Ratio, IsBase, AskForAddins,
-                    DocumentText, PreparationText, StyleText,
-                    StyleBackColor, StyleImageId, Priority
-                )
-                VALUES
-                (
-                    ?, ?, 1, 0, 1, 1, 1,
-                    ?, ?, ?,
-                    '0xFFFFFFFF',
-                    '00000000-0000-0000-0000-000000000000',
-                    0
-                )
-            """, nombre, new_product_id, nombre, nombre, nombre)
-
-            sale_format_id = dst_cursor.execute(
-                "SELECT CAST(SCOPE_IDENTITY() AS INT)"
-            ).fetchone()[0]
+                UPDATE Product
+                SET
+                    StockUnitId = 1,
+                    RecipeUnitId = NULL,
+                    MenuTag = NULL
+                WHERE Id = ?
+            """, new_product_id)
 
             dst_cursor.execute("""
-                INSERT INTO SaleFormatPrice
-                (
-                    PriceListId, Main, Addin, MenuItem,
-                    ReferenceCostPrice, UpdatedAt,
-                    SpecificVatId, SaleFormatId
+                SELECT StockUnitId, RecipeUnitId, MenuTag
+                FROM Product
+                WHERE Id = ?
+            """, new_product_id)
+
+            print("PRODUCTO:", new_product_id, dst_cursor.fetchone())
+
+            dst_cursor.execute("""
+                SELECT TOP 1 Id
+                FROM SaleFormat
+                WHERE ProductId = ?
+                  AND IsBase = 1
+                  AND DeletionDate IS NULL
+                ORDER BY Id
+            """, new_product_id)
+
+            sf = dst_cursor.fetchone()
+
+            if sf:
+                sale_format_id = sf.Id
+            else:
+                dst_cursor.execute("""
+                    INSERT INTO SaleFormat
+                    (
+                        Name, ProductId, SaleableAsMain, SaleableAsAddin,
+                        Ratio, IsBase, AskForAddins,
+                        DocumentText, PreparationText, StyleText,
+                        StyleBackColor, StyleImageId, Priority
+                    )
+                    VALUES
+                    (
+                        ?, ?, 1, 0, 1, 1, 1,
+                        ?, ?, ?,
+                        '0xFFFFFFFF',
+                        '00000000-0000-0000-0000-000000000000',
+                        0
+                    )
+                """, nombre, new_product_id, nombre, nombre, nombre)
+
+                dst_cursor.execute("""
+                    SELECT Id
+                    FROM SaleFormat
+                    WHERE ProductId = ?
+                      AND IsBase = 1
+                      AND DeletionDate IS NULL
+                    ORDER BY Id DESC
+                """, new_product_id)
+
+                sf_new = dst_cursor.fetchone()
+
+                if sf_new is None:
+                    raise Exception(
+                        f"No se creó SaleFormat para producto {nombre} ID {new_product_id}"
+                    )
+
+                sale_format_id = sf_new[0]
+
+            print("SALE FORMAT ID:", sale_format_id)
+
+            dst_cursor.execute("""
+                SELECT 1
+                FROM SaleFormatPrice
+                WHERE PriceListId = ?
+                  AND SaleFormatId = ?
+            """, price_list_id, sale_format_id)
+
+            if not dst_cursor.fetchone():
+
+                if sale_format_id is None:
+                    raise Exception(
+                        f"SaleFormatId NULL para producto {nombre} ID {new_product_id}"
+                    )
+
+                print(
+                    "PRODUCTO:",
+                    nombre,
+                    "ID:",
+                    new_product_id,
+                    "SALEFORMAT:",
+                    sale_format_id
                 )
-                VALUES
-                (
-                    1, 0, NULL, 0,
-                    ?, GETDATE(),
-                    NULL, ?
+
+                dst_cursor.execute("""
+                    INSERT INTO SaleFormatPrice
+                    (
+                        PriceListId,
+                        Main,
+                        Addin,
+                        MenuItem,
+                        ReferenceCostPrice,
+                        UpdatedAt,
+                        SpecificVatId,
+                        SaleFormatId
+                    )
+                    VALUES
+                    (
+                        ?, ?, NULL, 0,
+                        ?, GETDATE(),
+                        NULL, ?
+                    )
+                """,
+                    price_list_id,
+                    precio_venta,
+                    precio_coste or 0,
+                    sale_format_id
                 )
-            """, precio_coste or 0, sale_format_id)
 
             insertados += 1
 
